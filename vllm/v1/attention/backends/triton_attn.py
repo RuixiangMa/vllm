@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
+from vllm.v1.debug.kv_dump import dump_kv_cache_write
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -717,6 +718,14 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        dump_kv_cache_write(
+            layer_name=getattr(layer, "layer_name", "unknown_layer"),
+            backend_name="triton_attn",
+            key=key,
+            value=value,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             key_cache, value_cache = kv_cache.unbind(1)

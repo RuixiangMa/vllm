@@ -68,6 +68,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.debug.kv_dump import dump_kv_cache_write
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1840,6 +1841,14 @@ class FlashInferImpl(AttentionImpl):
             # actual tokens.
             k_cache = kv_cache[:, 0]
             v_cache = kv_cache[:, 1]
+            dump_kv_cache_write(
+                layer_name=getattr(layer, "layer_name", "unknown_layer"),
+                backend_name="flashinfer",
+                key=key,
+                value=value,
+                slot_mapping=slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
