@@ -73,7 +73,7 @@ class KVDumpWriter:
 
     def _write_manifest(self) -> None:
         manifest = {
-            "format_version": 1,
+            "format_version": 2,
             "dump_format": self.dump_format,
             "rank": self.rank,
             "pid": self.pid,
@@ -114,6 +114,7 @@ class KVDumpWriter:
 
         key_to_dump = key[:num_tokens].detach().cpu()
         value_to_dump = value[:num_tokens].detach().cpu()
+        slot_mapping_to_dump = slot_mapping.detach().cpu()
 
         with self._lock:
             if self.max_events is not None and self._events_written >= self.max_events:
@@ -128,6 +129,49 @@ class KVDumpWriter:
         payload = {
             "key": key_to_dump,
             "value": value_to_dump,
+            "slot_mapping": slot_mapping_to_dump,
+            "backend_name": backend_name,
+            "kv_cache_dtype": kv_cache_dtype,
+        }
+        torch.save(payload, path)
+
+    def dump_cache_blocks(
+        self,
+        *,
+        layer_name: str,
+        backend_name: str,
+        cache_blocks: torch.Tensor,
+        block_indices: torch.Tensor,
+        block_size: int,
+        kv_cache_dtype: str | None,
+    ) -> None:
+        if not self.should_dump(layer_name):
+            return
+        if cache_blocks.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+
+        cache_blocks_to_dump = cache_blocks.detach().cpu()
+        block_indices_to_dump = block_indices.reshape(-1).detach().cpu()
+        if cache_blocks_to_dump.numel() == 0 or block_indices_to_dump.numel() == 0:
+            return
+
+        with self._lock:
+            if self.max_events is not None and self._events_written >= self.max_events:
+                return
+            event_id = self._next_event_id
+            self._next_event_id += 1
+            self._events_written += 1
+
+        layer_dir = self.rank_dir / _sanitize_layer_name(layer_name)
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        path = layer_dir / f"event_{event_id:08d}.pt"
+        payload = {
+            "cache_blocks": cache_blocks_to_dump,
+            "block_indices": block_indices_to_dump,
+            "block_size": int(block_size),
+            "dump_kind": "post_layout_blocks",
+            "backend_name": backend_name,
+            "kv_cache_dtype": kv_cache_dtype,
         }
         torch.save(payload, path)
 
@@ -165,5 +209,27 @@ def dump_kv_cache_write(
         key=key,
         value=value,
         slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+
+def dump_kv_cache_blocks(
+    *,
+    layer_name: str,
+    backend_name: str,
+    cache_blocks: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_size: int,
+    kv_cache_dtype: str | None,
+) -> None:
+    writer = get_kv_dump_writer()
+    if writer is None:
+        return
+    writer.dump_cache_blocks(
+        layer_name=layer_name,
+        backend_name=backend_name,
+        cache_blocks=cache_blocks,
+        block_indices=block_indices,
+        block_size=block_size,
         kv_cache_dtype=kv_cache_dtype,
     )

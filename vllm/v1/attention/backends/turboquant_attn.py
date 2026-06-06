@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 from vllm.triton_utils import triton
+from vllm.v1.debug.kv_dump import dump_kv_cache_blocks, dump_kv_cache_write
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -383,7 +384,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
+        layer_name = getattr(layer, "layer_name", "unknown_layer")
+        dump_kv_cache_write(
+            layer_name=layer_name,
+            backend_name="turboquant",
+            key=k,
+            value=v,
+            slot_mapping=slot_mapping,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
         self._store_kv(k, v, kv_cache, slot_mapping, layer)
+
+        valid_slot_mapping = slot_mapping[:N].reshape(-1)
+        valid_slot_mapping = valid_slot_mapping[valid_slot_mapping >= 0]
+        if valid_slot_mapping.numel() > 0:
+            block_size = kv_cache.shape[1]
+            block_indices = torch.unique(valid_slot_mapping // block_size, sorted=True)
+            dump_kv_cache_blocks(
+                layer_name=layer_name,
+                backend_name="turboquant",
+                cache_blocks=kv_cache.index_select(0, block_indices),
+                block_indices=block_indices,
+                block_size=block_size,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
 
     def forward(
         self,

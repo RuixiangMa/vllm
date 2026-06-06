@@ -28,7 +28,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.debug.kv_dump import dump_kv_cache_write
+from vllm.v1.debug.kv_dump import dump_kv_cache_blocks, dump_kv_cache_write
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -890,6 +890,19 @@ class FlashAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
+
+        valid_slots = slot_mapping[slot_mapping >= 0]
+        if valid_slots.numel() > 0:
+            block_size = kv_cache.shape[2]
+            block_indices = torch.unique(valid_slots // block_size)
+            dump_kv_cache_blocks(
+                layer_name=getattr(layer, "layer_name", "unknown_layer"),
+                backend_name="flash_attn",
+                cache_blocks=kv_cache.index_select(0, block_indices),
+                block_indices=block_indices,
+                block_size=block_size,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
 
     def _forward_with_dcp(
         self,
