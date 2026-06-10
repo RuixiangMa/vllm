@@ -123,13 +123,52 @@ class KVDumpWriter:
             self._next_event_id += 1
             self._events_written += 1
 
-        layer_dir = self.rank_dir / _sanitize_layer_name(layer_name)
+        layer_dir = self.rank_dir / "raw_kv" / _sanitize_layer_name(layer_name)
         layer_dir.mkdir(parents=True, exist_ok=True)
         path = layer_dir / f"event_{event_id:08d}.pt"
         payload = {
             "key": key_to_dump,
             "value": value_to_dump,
             "slot_mapping": slot_mapping_to_dump,
+            "backend_name": backend_name,
+            "kv_cache_dtype": kv_cache_dtype,
+        }
+        torch.save(payload, path)
+
+    def dump_quantized_payload(
+        self,
+        *,
+        layer_name: str,
+        backend_name: str,
+        quantized_payload: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str | None,
+        dump_kind: str = "post_write_slot_view",
+    ) -> None:
+        if not self.should_dump(layer_name):
+            return
+        if quantized_payload.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+
+        quantized_payload_to_dump = quantized_payload.detach().cpu()
+        slot_mapping_to_dump = slot_mapping.reshape(-1).detach().cpu()
+        if quantized_payload_to_dump.numel() == 0 or slot_mapping_to_dump.numel() == 0:
+            return
+
+        with self._lock:
+            if self.max_events is not None and self._events_written >= self.max_events:
+                return
+            event_id = self._next_event_id
+            self._next_event_id += 1
+            self._events_written += 1
+
+        layer_dir = self.rank_dir / "quantized_payload" / _sanitize_layer_name(layer_name)
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        path = layer_dir / f"event_{event_id:08d}.pt"
+        payload = {
+            "quantized_payload": quantized_payload_to_dump,
+            "slot_mapping": slot_mapping_to_dump,
+            "dump_kind": dump_kind,
             "backend_name": backend_name,
             "kv_cache_dtype": kv_cache_dtype,
         }
@@ -162,7 +201,7 @@ class KVDumpWriter:
             self._next_event_id += 1
             self._events_written += 1
 
-        layer_dir = self.rank_dir / _sanitize_layer_name(layer_name)
+        layer_dir = self.rank_dir / "cache_blocks" / _sanitize_layer_name(layer_name)
         layer_dir.mkdir(parents=True, exist_ok=True)
         path = layer_dir / f"event_{event_id:08d}.pt"
         payload = {
@@ -232,4 +271,26 @@ def dump_kv_cache_blocks(
         block_indices=block_indices,
         block_size=block_size,
         kv_cache_dtype=kv_cache_dtype,
+    )
+
+
+def dump_quantized_payload(
+    *,
+    layer_name: str,
+    backend_name: str,
+    quantized_payload: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str | None,
+    dump_kind: str = "post_write_slot_view",
+) -> None:
+    writer = get_kv_dump_writer()
+    if writer is None:
+        return
+    writer.dump_quantized_payload(
+        layer_name=layer_name,
+        backend_name=backend_name,
+        quantized_payload=quantized_payload,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        dump_kind=dump_kind,
     )

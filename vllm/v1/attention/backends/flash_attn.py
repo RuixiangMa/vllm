@@ -28,7 +28,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.debug.kv_dump import dump_kv_cache_blocks, dump_kv_cache_write
+from vllm.v1.debug.kv_dump import dump_kv_cache_blocks, dump_kv_cache_write, dump_quantized_payload
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -902,6 +902,18 @@ class FlashAttentionImpl(AttentionImpl):
                 block_indices=block_indices,
                 block_size=block_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+            )
+
+            slot_data = kv_cache[
+                valid_slots // block_size, :, valid_slots % block_size
+            ]
+            dump_quantized_payload(
+                layer_name=getattr(layer, "layer_name", "unknown_layer"),
+                backend_name="flash_attn",
+                quantized_payload=slot_data,
+                slot_mapping=valid_slots,
+                kv_cache_dtype=self.kv_cache_dtype,
+                dump_kind="post_write_slot_view",
             )
 
     def _forward_with_dcp(

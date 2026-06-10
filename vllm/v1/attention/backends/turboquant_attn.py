@@ -30,7 +30,11 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
 from vllm.triton_utils import triton
-from vllm.v1.debug.kv_dump import dump_kv_cache_blocks, dump_kv_cache_write
+from vllm.v1.debug.kv_dump import (
+    dump_kv_cache_blocks,
+    dump_kv_cache_write,
+    dump_quantized_payload,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -407,6 +411,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 block_indices=block_indices,
                 block_size=block_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+            )
+
+            slot_data = kv_cache[
+                valid_slot_mapping // block_size, valid_slot_mapping % block_size
+            ]
+            dump_quantized_payload(
+                layer_name=layer_name,
+                backend_name="turboquant",
+                quantized_payload=slot_data,
+                slot_mapping=valid_slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+                dump_kind="post_write_slot_view",
             )
 
     def forward(
