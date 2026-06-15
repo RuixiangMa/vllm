@@ -147,10 +147,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     ) -> int:
         ctx = self._compress_ctx
         assert ctx is not None
-        total_compressed = ctx.transfer_comp(
+        return ctx.transfer_comp(
             gpu_block_ids, cpu_block_ids, start_layer_id, num_layers, stream
         )
-        return total_compressed
 
     def _load_and_decompress(
         self,
@@ -162,24 +161,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     ) -> int:
         ctx = self._compress_ctx
         assert ctx is not None
-        total_compressed = ctx.transfer_decomp(
+        return ctx.transfer_decomp(
             gpu_block_ids, cpu_block_ids, start_layer_id, num_layers, stream
         )
-        return total_compressed
 
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        src_spec, dst_spec = transfer_spec
-        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
-        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
-
-        src_blocks = src_spec.block_ids
-        dst_blocks = dst_spec.block_ids
-        assert src_blocks.ndim == 1
-        assert dst_blocks.ndim == 1
-
-        num_src_blocks = len(src_blocks)
-        num_dst_blocks = len(dst_blocks)
-
+    def _build_batch_copy_ops(
+        self,
+        src_spec: BlockIDsLoadStoreSpec,
+        dst_spec: BlockIDsLoadStoreSpec,
+        num_src_blocks: int,
+        num_dst_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
         group_sizes = gpu_spec.group_sizes
@@ -225,8 +217,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             src_end_offset = src_offset + src_blocks_count
             assert src_end_offset <= num_src_blocks
 
-            group_src = src_blocks[src_offset:src_end_offset]
-            group_dst = dst_blocks[dst_offset:dst_end_offset]
+            group_src = src_spec.block_ids[src_offset:src_end_offset]
+            group_dst = dst_spec.block_ids[dst_offset:dst_end_offset]
 
             for data_ref in group_data_refs:
                 t_idx = data_ref.tensor_idx
@@ -262,6 +254,53 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         batch_dst = torch.from_numpy(all_dst)
         batch_sizes = torch.from_numpy(all_sizes)
 
+        return batch_src, batch_dst, batch_sizes, num_transfer_bytes
+
+    def _compute_uncompressed_bytes(
+        self,
+        src_spec: BlockIDsLoadStoreSpec,
+        dst_spec: BlockIDsLoadStoreSpec,
+    ) -> int:
+        gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
+        assert isinstance(gpu_spec, GPULoadStoreSpec)
+        group_sizes = gpu_spec.group_sizes
+        num_bytes = 0
+        for group_size, group_data_refs in zip(
+            group_sizes, self.kv_cache_groups_data_refs
+        ):
+            for data_ref in group_data_refs:
+                num_bytes += group_size * data_ref.page_size_bytes
+        return num_bytes
+
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        src_spec, dst_spec = transfer_spec
+        assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+
+        src_blocks = src_spec.block_ids
+        dst_blocks = dst_spec.block_ids
+        assert src_blocks.ndim == 1
+        assert dst_blocks.ndim == 1
+
+        num_src_blocks = len(src_blocks)
+        num_dst_blocks = len(dst_blocks)
+
+        use_compress = isinstance(self._compress_ctx, ANSCompressContextCExt)
+
+        if use_compress:
+            num_transfer_bytes = self._compute_uncompressed_bytes(
+                src_spec, dst_spec
+            )
+            batch_src = batch_dst = batch_sizes = None
+            num_copy_ops = 0
+        else:
+            batch_src, batch_dst, batch_sizes, num_transfer_bytes = (
+                self._build_batch_copy_ops(
+                    src_spec, dst_spec, num_src_blocks, num_dst_blocks
+                )
+            )
+            num_copy_ops = len(batch_src)
+
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
             self._event_pool.pop()
@@ -287,35 +326,34 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         with torch.cuda.stream(stream):
             start_event.record(stream)
-            if num_copy_ops > 0:
-                if isinstance(self._compress_ctx, ANSCompressContextCExt):
-                    gpu_block_ids_np = src_blocks if self.gpu_to_cpu else dst_blocks
-                    cpu_block_ids_np = dst_blocks if self.gpu_to_cpu else src_blocks
-                    start_layer_id = 0
-                    num_layers = len(self.src_tensors) // 2
-                    if self.gpu_to_cpu:
-                        num_compressed_bytes = self._compress_and_offload(
-                            gpu_block_ids_np,
-                            cpu_block_ids_np,
-                            start_layer_id,
-                            num_layers,
-                            stream,
-                        )
-                    else:
-                        num_compressed_bytes = self._load_and_decompress(
-                            gpu_block_ids_np,
-                            cpu_block_ids_np,
-                            start_layer_id,
-                            num_layers,
-                            stream,
-                        )
-                else:
-                    ops.swap_blocks_batch(
-                        batch_src,
-                        batch_dst,
-                        batch_sizes,
-                        is_src_access_order_any=is_src_access_order_any,
+            if use_compress:
+                gpu_block_ids_np = src_blocks if self.gpu_to_cpu else dst_blocks
+                cpu_block_ids_np = dst_blocks if self.gpu_to_cpu else src_blocks
+                num_kv = 1 if self._compress_ctx.is_mla else 2
+                num_layers = len(self.src_tensors) // num_kv
+                if self.gpu_to_cpu:
+                    num_compressed_bytes = self._compress_and_offload(
+                        gpu_block_ids_np,
+                        cpu_block_ids_np,
+                        0,
+                        num_layers,
+                        stream,
                     )
+                else:
+                    num_compressed_bytes = self._load_and_decompress(
+                        gpu_block_ids_np,
+                        cpu_block_ids_np,
+                        0,
+                        num_layers,
+                        stream,
+                    )
+            elif num_copy_ops > 0:
+                ops.swap_blocks_batch(
+                    batch_src,
+                    batch_dst,
+                    batch_sizes,
+                    is_src_access_order_any=is_src_access_order_any,
+                )
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event

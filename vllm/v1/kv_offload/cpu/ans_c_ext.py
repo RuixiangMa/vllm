@@ -15,6 +15,8 @@ try:
 except ImportError:
     HAS_ANS_C_EXT = False
 
+_VALID_COMPRESS_LAYOUTS = ("post_layout", "pre_layout")
+
 
 @dataclass
 class CompressionGranularity:
@@ -25,16 +27,21 @@ class CompressionGranularity:
 @dataclass
 class CompressionConfig:
     enable_compression: bool = False
-    algorithm: str = "ans"
     granularity: CompressionGranularity = None
-    compress_layout: str = "post_layout"  # "post_layout" | "pre_layout"
+    compress_layout: str = "post_layout"
+    is_mla: bool = False
 
     def __post_init__(self):
         if self.granularity is None:
             self.granularity = CompressionGranularity()
+        if self.compress_layout not in _VALID_COMPRESS_LAYOUTS:
+            raise ValueError(
+                f"compress_layout must be one of {_VALID_COMPRESS_LAYOUTS}, "
+                f"got '{self.compress_layout}'"
+            )
         if self.enable_compression and not HAS_ANS_C_EXT:
             logger.warning(
-                "nvCOMP C++ extension is not available, disabling KV cache compression."
+                "ANS C++ extension is not available, disabling KV cache compression."
             )
             self.enable_compression = False
 
@@ -51,9 +58,9 @@ class CompressionConfig:
         )
         return CompressionConfig(
             enable_compression=comp.get("enable_compression", False),
-            algorithm=comp.get("algorithm", "ans"),
             granularity=granularity,
             compress_layout=comp.get("compress_layout", "post_layout"),
+            is_mla=comp.get("is_mla", False),
         )
 
 
@@ -68,14 +75,14 @@ class ANSCompressContextCExt:
         self.gpu_tensors = gpu_tensors
         self.cpu_tensors = cpu_tensors
         self.config = config
-        num_kv = 2
+        self.is_mla = config.is_mla
+        num_kv = 1 if self.is_mla else 2
         self.num_layers = len(gpu_tensors) // num_kv
         self.page_size_bytes = gpu_tensors[0].shape[1]
         self.cpu_slot_bytes = cpu_tensors[0].shape[1]
 
         self.chunk_size_bytes = self.page_size_bytes
 
-        num_kv = 2
         max_chunks_per_batch = min(
             num_cpu_blocks * self.num_layers * num_kv,
             4096,
@@ -111,14 +118,14 @@ class ANSCompressContextCExt:
 
         self.cpu_size_table_block_stride = self.num_layers * num_kv
         self.cpu_size_table_layer_stride = num_kv
-        self.is_mla = False
 
         logger.info(
             "ANS C++ extension context created: max_chunks=%d, "
-            "chunk_size=%d, cpu_slot=%d",
+            "chunk_size=%d, cpu_slot=%d, is_mla=%s",
             max_chunks_per_batch,
             self.chunk_size_bytes,
             self.cpu_slot_bytes,
+            self.is_mla,
         )
 
     def transfer_comp(

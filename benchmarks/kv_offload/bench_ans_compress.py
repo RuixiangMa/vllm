@@ -13,13 +13,14 @@ from __future__ import annotations
 import argparse
 import time
 
+import numpy as np
 import torch
 
-from vllm.v1.kv_offload.cpu.ans_compress import (
-    ANSCompressContext,
+from vllm.v1.kv_offload.cpu.ans_c_ext import (
+    ANSCompressContextCExt,
     CompressionConfig,
     CompressionGranularity,
-    HAS_NVCOMP,
+    HAS_ANS_C_EXT,
 )
 
 
@@ -31,21 +32,25 @@ def benchmark_compression(
     cross_layer: bool,
     iterations: int,
 ):
-    if not HAS_NVCOMP:
-        print("nvCOMP not available, cannot benchmark.")
+    if not HAS_ANS_C_EXT:
+        print("ANS C++ extension not available, cannot benchmark.")
         return
 
+    num_kv = 2
+    total_tensors = num_layers * num_kv
+    cpu_slot_bytes = page_size_bytes * num_layers if cross_layer else page_size_bytes
+
     gpu_tensors = [
-        torch.randint(
-            -128, 127, (num_blocks, page_size_bytes), dtype=torch.int8, device="cuda"
-        )
-        for _ in range(num_layers)
+        torch.randn(
+            num_blocks, page_size_bytes // 2, dtype=torch.float16, device="cuda"
+        ).view(torch.int8)
+        for _ in range(total_tensors)
     ]
     cpu_tensors = [
         torch.zeros(
-            (num_blocks, page_size_bytes), dtype=torch.int8, device="cpu", pin_memory=True
+            (num_blocks, cpu_slot_bytes), dtype=torch.int8, device="cpu", pin_memory=True
         )
-        for _ in range(num_layers)
+        for _ in range(total_tensors)
     ]
 
     config = CompressionConfig(
@@ -54,56 +59,47 @@ def benchmark_compression(
             blocks_per_chunk=blocks_per_chunk, cross_layer=cross_layer
         ),
     )
-    ctx = ANSCompressContext(
+    ctx = ANSCompressContextCExt(
         gpu_tensors=gpu_tensors,
         cpu_tensors=cpu_tensors,
         num_cpu_blocks=num_blocks,
         config=config,
     )
 
-    layer_indices = list(range(num_layers))
-    block_ids = list(range(num_blocks))
+    gpu_block_ids = np.arange(num_blocks, dtype=np.int64)
+    cpu_block_ids = np.arange(num_blocks, dtype=np.int64)
 
     compress_times = []
-    all_compress_data: list[list[tuple[int, bool]]] = []
+    compress_bytes = []
     for _ in range(iterations):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        chunk_results: list[tuple[int, bool]] = []
-        ci = 0
-        while ci < len(block_ids):
-            comp_size, count, fits = ctx.compress_one_chunk(
-                block_ids, ci, layer_indices
-            )
-            chunk_results.append((comp_size, fits))
-            ci += count
+        total_comp = ctx.transfer_comp(
+            gpu_block_ids, cpu_block_ids, 0, num_layers, torch.cuda.current_stream()
+        )
         torch.cuda.synchronize()
         compress_times.append(time.perf_counter() - t0)
-        all_compress_data.append(chunk_results)
-
-    total_uncompressed = num_blocks * page_size_bytes * num_layers
-    total_compressed = sum(s for chunk_list in all_compress_data for s, _ in chunk_list)
-    ratio = total_compressed / total_uncompressed if total_uncompressed > 0 else 1.0
+        compress_bytes.append(total_comp)
 
     decompress_times = []
-    for chunk_list in all_compress_data:
+    for _ in range(iterations):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        ci = 0
-        for comp_size, fits in chunk_list:
-            if fits and comp_size > 0:
-                ctx.decompress_one_chunk(
-                    block_ids, ci, layer_indices, comp_size
-                )
-            ci += blocks_per_chunk
+        ctx.transfer_decomp(
+            gpu_block_ids, cpu_block_ids, 0, num_layers, torch.cuda.current_stream()
+        )
         torch.cuda.synchronize()
         decompress_times.append(time.perf_counter() - t0)
+
+    total_uncompressed = num_blocks * page_size_bytes * total_tensors
+    total_compressed = compress_bytes[-1]
+    ratio = total_compressed / total_uncompressed if total_uncompressed > 0 else 1.0
 
     d2h_uncompressed_us = total_uncompressed / 32e9 * 1e6
     d2h_compressed_us = total_compressed / 32e9 * 1e6
 
-    print(f"=== ANS Compression Benchmark ===")
-    print(f"Config: {num_blocks} blocks x {page_size_bytes} B/page x {num_layers} layers")
+    print(f"=== ANS Compression Benchmark (CExt) ===")
+    print(f"Config: {num_blocks} blocks x {page_size_bytes} B/page x {num_layers} layers x {num_kv} kv")
     print(f"Granularity: blocks_per_chunk={blocks_per_chunk}, cross_layer={cross_layer}")
     print(f"Compression ratio: {ratio:.3f} ({total_compressed}/{total_uncompressed} bytes)")
     print(f"Compress latency (avg): {sum(compress_times)/len(compress_times)*1e3:.2f} ms")
@@ -111,6 +107,8 @@ def benchmark_compression(
     print(f"D2H uncompressed @32GB/s: {d2h_uncompressed_us:.1f} us")
     print(f"D2H compressed @32GB/s: {d2h_compressed_us:.1f} us")
     print(f"Bandwidth saved: {(1-ratio)*100:.1f}%")
+
+    ctx.destroy()
 
 
 def main():
