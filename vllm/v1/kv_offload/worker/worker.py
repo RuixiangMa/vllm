@@ -18,9 +18,11 @@ logger = init_logger(__name__)
 class TransferResult:
     job_id: int
     success: bool
-    transfer_size: int | None = None  # Size in bytes
+    transfer_size: int | None = None
     transfer_time: float | None = None
     transfer_type: TransferType | None = None
+    num_compressed_bytes: int = 0
+    num_uncompressed_bytes: int = 0
 
 
 class OffloadingHandler(ABC):

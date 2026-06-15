@@ -17,6 +17,11 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
 )
+from vllm.v1.kv_offload.cpu.ans_c_ext import (
+    ANSCompressContextCExt,
+    CompressionConfig,
+    HAS_ANS_C_EXT,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -34,6 +39,8 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    num_compressed_bytes: int
+    num_uncompressed_bytes: int
 
 
 def compute_sub_block_ptrs(
@@ -43,25 +50,6 @@ def compute_sub_block_ptrs(
     tensor: torch.Tensor,
     skip_count: int = 0,
 ):
-    """
-    Compute byte pointers for sub-blocks of the given block IDs.
-
-    Each block in block_ids contains block_size_factor sub-blocks.
-    The pointer for sub-block j of block b is:
-        base_ptr + b * row_stride + j * sub_block_size
-
-    where sub_block_size = tensor.shape[1] // block_size_factor (gpu page size).
-
-    This handles tensors where row_stride != block_size_factor * sub_block_size
-    (e.g. non-contiguous CPU tensors).
-
-    Args:
-        block_ids: array of block IDs at the tensor's native granularity.
-        block_size_factor: number of sub-blocks per block.
-        output: pre-allocated int64 array to write pointers into.
-        tensor: the source or destination tensor.
-        skip_count: sub-blocks to skip in the first block.
-    """
     assert skip_count < block_size_factor
 
     num_sub_blocks = len(output)
@@ -69,25 +57,20 @@ def compute_sub_block_ptrs(
     row_stride = tensor.stride(0)
 
     if block_size_factor == 1:
-        # Fast path: 1:1 mapping, no sub-block expansion needed.
         output[:] = base_ptr + block_ids[:num_sub_blocks] * row_stride
         return
 
-    # Vectorized expansion for block_size_factor > 1.
     assert tensor.shape[1] % block_size_factor == 0
     sub_block_size = tensor.shape[1] // block_size_factor
     sub_offsets = np.arange(block_size_factor, dtype=np.int64) * sub_block_size
-    # (num_blocks, 1) + (1, block_size_factor) -> (num_blocks, block_size_factor)
     all_ptrs = (
         base_ptr + block_ids.astype(np.int64)[:, np.newaxis] * row_stride
     ) + sub_offsets[np.newaxis, :]
-    # Flatten and apply skip_count / truncation
     flat = all_ptrs.ravel()
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
@@ -109,13 +92,6 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 
 
 class SingleDirectionOffloadingHandler(OffloadingHandler):
-    """
-    SingleDirectionOffloadingHandler handles transfers for a single direction,
-    either CPU->GPU or GPU->CPU.
-    Transfers are guaranteed to be executed in order of their submission.
-    Each transfer uses a unique CUDA stream, and its stream will start
-    executing only after the streams of previous transfers have finished.
-    """
 
     def __init__(
         self,
@@ -125,23 +101,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        compress_ctx: ANSCompressContextCExt | None = None,
     ):
-        """
-        Initialize a SingleDirectionOffloadingHandler.
-
-        Args:
-            gpu_tensors: list of GPU KV cache tensors.
-                Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
-            cpu_tensors: list of CPU KV cache tensors.
-                Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
-                Order should match gpu_tensors.
-            kv_cache_groups_data_refs: list of CanonicalKVCacheRef per group.
-            gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
-        """
         assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
 
-        # assert input tensors are as expected
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
@@ -162,22 +126,46 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
 
-        # GPU blocks may be smaller
-        # cpu_page_size = gpu_page_size * block_size_factor.
         self.src_block_size_factor = 1 if self.gpu_to_cpu else block_size_factor
         self.dst_block_size_factor = block_size_factor if self.gpu_to_cpu else 1
 
         self.transfer_type = ("GPU", "CPU") if self.gpu_to_cpu else ("CPU", "GPU")
-        # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
-        # job_id -> event
+        self._compress_ctx = compress_ctx
         self._transfer_events: dict[int, torch.Event] = {}
-        # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
-        # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
-        # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
+
+    def _compress_and_offload(
+        self,
+        gpu_block_ids: np.ndarray,
+        cpu_block_ids: np.ndarray,
+        start_layer_id: int,
+        num_layers: int,
+        stream: torch.cuda.Stream,
+    ) -> int:
+        ctx = self._compress_ctx
+        assert ctx is not None
+        total_compressed = ctx.transfer_comp(
+            gpu_block_ids, cpu_block_ids, start_layer_id, num_layers, stream
+        )
+        return total_compressed
+
+    def _load_and_decompress(
+        self,
+        gpu_block_ids: np.ndarray,
+        cpu_block_ids: np.ndarray,
+        start_layer_id: int,
+        num_layers: int,
+        stream: torch.cuda.Stream,
+    ) -> int:
+        ctx = self._compress_ctx
+        assert ctx is not None
+        total_compressed = ctx.transfer_decomp(
+            gpu_block_ids, cpu_block_ids, start_layer_id, num_layers, stream
+        )
+        return total_compressed
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         src_spec, dst_spec = transfer_spec
@@ -192,32 +180,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         num_src_blocks = len(src_blocks)
         num_dst_blocks = len(dst_blocks)
 
-        # There are 2 types of transfers:
-        # 1. GPU -> CPU
-        # 2. CPU -> GPU
-        #
-        # transfers are also to CPU blocks, EXCEPT MAYBE for the first and last block.
-        # i.e. the first and last CPU blocks in src_blocks can match against
-        # a smaller (byte-wise) set of GPU blocks in dst_blocks.
-        # In such cases, we may need to skip some gpu-sized sub-blocks,
-        # and start reading/writing from the middle of the first CPU block.
-        # If we have multiple KV cache groups (when using HMA with hybrid models),
-        # we may have a partial first/last CPU block per each group.
-        # The group_sizes parameter encodes the size of each group of blocks
-        # in the GPU dst_blocks.
-        # If group_sizes is None, we assume all blocks belong to a single group.
-        # The logical_offset parameter maps each group of blocks to its logical
-        # offset inside the request, counting in GPU blocks.
-        # This allows us to find the correct starting position
-        # in the matching first CPU block.
-
-        # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
         group_sizes = gpu_spec.group_sizes
         assert len(group_sizes) == len(self.kv_cache_groups_data_refs)
 
-        # extract block indices from the GPU spec
         block_indices = gpu_spec.block_indices
         assert len(block_indices) == len(self.kv_cache_groups_data_refs)
 
@@ -234,7 +201,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_offset = 0
         dst_offset = 0
         op_idx = 0
-        # count total number of bytes copied
         num_transfer_bytes = 0
         for group_size, block_idx, group_data_refs in zip(
             group_sizes, block_indices, self.kv_cache_groups_data_refs
@@ -309,29 +275,47 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         )
 
         if self.gpu_to_cpu:
-            # wait for model computation to finish before offloading
             stream.wait_stream(torch.cuda.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
             stream.wait_event(last_event)
-        # CPU->GPU reads from host pinned memory, which is never written
-        # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
-        # safe and lets the driver pipeline source reads. GPU->CPU reads
-        # from the live GPU KV cache, which the compute stream keeps
-        # writing; we must keep STREAM ordering so source reads are gated
-        # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+
+        num_compressed_bytes = 0
+        num_uncompressed_bytes = num_transfer_bytes
+
         with torch.cuda.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
-                ops.swap_blocks_batch(
-                    batch_src,
-                    batch_dst,
-                    batch_sizes,
-                    is_src_access_order_any=is_src_access_order_any,
-                )
+                if isinstance(self._compress_ctx, ANSCompressContextCExt):
+                    gpu_block_ids_np = src_blocks if self.gpu_to_cpu else dst_blocks
+                    cpu_block_ids_np = dst_blocks if self.gpu_to_cpu else src_blocks
+                    start_layer_id = 0
+                    num_layers = len(self.src_tensors) // 2
+                    if self.gpu_to_cpu:
+                        num_compressed_bytes = self._compress_and_offload(
+                            gpu_block_ids_np,
+                            cpu_block_ids_np,
+                            start_layer_id,
+                            num_layers,
+                            stream,
+                        )
+                    else:
+                        num_compressed_bytes = self._load_and_decompress(
+                            gpu_block_ids_np,
+                            cpu_block_ids_np,
+                            start_layer_id,
+                            num_layers,
+                            stream,
+                        )
+                else:
+                    ops.swap_blocks_batch(
+                        batch_src,
+                        batch_dst,
+                        batch_sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -342,10 +326,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=num_transfer_bytes,
+                num_compressed_bytes=num_compressed_bytes,
+                num_uncompressed_bytes=num_uncompressed_bytes,
             )
         )
 
-        # success
         return True
 
     def get_finished(self) -> list[TransferResult]:
@@ -354,13 +339,15 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-            )  # elapsed_time is in milliseconds
+            )
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
                 transfer_size=transfer.num_bytes,
                 transfer_time=transfer_time,
                 transfer_type=self.transfer_type,
+                num_compressed_bytes=transfer.num_compressed_bytes,
+                num_uncompressed_bytes=transfer.num_uncompressed_bytes,
             )
 
             results.append(result)
@@ -397,6 +384,7 @@ class CpuGpuOffloadingHandlers:
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        compression_config: CompressionConfig | None = None,
     ):
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -434,6 +422,25 @@ class CpuGpuOffloadingHandlers:
             gpu_tensors.append(gpu_tensor)
             cpu_tensors.append(cpu_tensor)
 
+        compress_ctx = None
+        if compression_config is not None and compression_config.enable_compression:
+            if HAS_ANS_C_EXT:
+                compress_ctx = ANSCompressContextCExt(
+                    gpu_tensors=gpu_tensors,
+                    cpu_tensors=cpu_tensors,
+                    num_cpu_blocks=num_cpu_blocks,
+                    config=compression_config,
+                )
+                logger.info(
+                    "KV cache ANS compression enabled (C++ ext): granularity=%s",
+                    compression_config.granularity,
+                )
+            else:
+                logger.warning(
+                    "ANS compression requested but C++ extension not available, "
+                    "falling back to uncompressed transfer"
+                )
+
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             gpu_tensors=gpu_tensors,
             cpu_tensors=cpu_tensors,
@@ -441,6 +448,7 @@ class CpuGpuOffloadingHandlers:
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             mmap_region=mmap_region,
+            compress_ctx=compress_ctx,
         )
 
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
@@ -449,4 +457,5 @@ class CpuGpuOffloadingHandlers:
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            compress_ctx=compress_ctx,
         )

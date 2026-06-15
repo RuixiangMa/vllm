@@ -20,20 +20,35 @@ logger = init_logger(__name__)
 class OffloadingOperationMetrics:
     op_size: int
     op_time: float
+    op_compressed_bytes: int = 0
+    op_uncompressed_bytes: int = 0
 
 
 @dataclass
 class OffloadingConnectorStats(KVConnectorStats):
+    total_compressed_bytes: int = 0
+    total_uncompressed_bytes: int = 0
+
     def __post_init__(self):
         if not self.data:
-            # Empty container init, no data is passed in.
             self.reset()
 
     def reset(self):
         self.data: dict[str, list[OffloadingOperationMetrics]] = {}
+        self.total_compressed_bytes = 0
+        self.total_uncompressed_bytes = 0
+
+    @property
+    def compression_ratio(self) -> float:
+        if self.total_uncompressed_bytes > 0:
+            return self.total_compressed_bytes / self.total_uncompressed_bytes
+        return 1.0
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
+            assert isinstance(other, OffloadingConnectorStats)
+            self.total_compressed_bytes += other.total_compressed_bytes
+            self.total_uncompressed_bytes += other.total_uncompressed_bytes
             for k, v in other.data.items():
                 if k not in self.data:
                     self.data[k] = v
@@ -44,32 +59,46 @@ class OffloadingConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        """
-        Reduce the observations collected during a time interval to one or
-        more representative values (eg avg/median/sum of the series).
-        This is meant to be called by the logger to produce a summary of the
-        stats for the last time interval.
-        """
         return_dict: dict[str, int | float] = {}
         for transfer_type, ops_list in self.data.items():
             assert isinstance(ops_list, list)
             total_bytes = 0
             total_time = 0.0
+            total_compressed = 0
+            total_uncompressed = 0
             for op in ops_list:
                 assert isinstance(op, dict)
                 total_bytes += op["op_size"]
                 total_time += op["op_time"]
+                total_compressed += op.get("op_compressed_bytes", 0)
+                total_uncompressed += op.get("op_uncompressed_bytes", 0)
             return_dict[f"{transfer_type}_total_bytes"] = total_bytes
             return_dict[f"{transfer_type}_total_time"] = total_time
+            return_dict[f"{transfer_type}_total_compressed_bytes"] = total_compressed
+            return_dict[f"{transfer_type}_total_uncompressed_bytes"] = total_uncompressed
         return return_dict
 
     def is_empty(self) -> bool:
         return not self.data
 
-    def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
+    def record_transfer(
+        self,
+        num_bytes: int,
+        time: float,
+        transfer_type: TransferType,
+        num_compressed_bytes: int = 0,
+        num_uncompressed_bytes: int = 0,
+    ):
         src, dst = transfer_type
         transfer_type_key = src + "_to_" + dst
-        op = OffloadingOperationMetrics(num_bytes, time)
+        op = OffloadingOperationMetrics(
+            num_bytes,
+            time,
+            op_compressed_bytes=num_compressed_bytes,
+            op_uncompressed_bytes=num_uncompressed_bytes,
+        )
+        self.total_compressed_bytes += num_compressed_bytes
+        self.total_uncompressed_bytes += num_uncompressed_bytes
         if transfer_type_key in self.data:
             self.data[transfer_type_key].append(op)
         else:
