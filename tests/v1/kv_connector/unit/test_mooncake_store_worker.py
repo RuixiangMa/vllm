@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from tests.utils import create_new_process_for_each_test
 from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.distributed import mooncake_store
 from vllm.distributed.kv_events import KVEventAggregator
@@ -5339,6 +5340,62 @@ def test_lookup_applies_swa_mask_before_accessing_hashes():
 # ---------------------------------------------------------------------------
 # register_kv_caches tests
 # ---------------------------------------------------------------------------
+
+
+@create_new_process_for_each_test()
+@pytest.mark.parametrize("connector_name", ["MooncakeStoreConnector", "MultiConnector"])
+def test_llm_cleans_up_mooncake_registration_exception(
+    vllm_runner, tmp_path, monkeypatch, connector_name
+):
+    """Registration exceptions must release the Store and global connector."""
+    from vllm.config import KVTransferConfig
+    from vllm.distributed.kv_transfer import has_kv_transfer_group
+
+    store = MagicMock()
+    store.setup.return_value = 0
+    registration_error = RuntimeError("Mooncake buffer registration exception")
+    store.register_buffer.side_effect = registration_error
+    _install_fake_mooncake(monkeypatch, store)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {"protocol": "tcp", "master_server_address": "127.0.0.1:50051"},
+        ),
+    )
+
+    extra_config = (
+        {
+            "connectors": [
+                {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both"}
+            ]
+        }
+        if connector_name == "MultiConnector"
+        else {}
+    )
+    try:
+        _model = vllm_runner(
+            "facebook/opt-125m",
+            max_model_len=128,
+            enforce_eager=True,
+            default_torch_num_threads=1,
+            num_gpu_blocks_override=16,
+            kv_transfer_config=KVTransferConfig(
+                kv_connector=connector_name,
+                kv_role="kv_both",
+                kv_connector_extra_config=extra_config,
+            ),
+        )
+    except RuntimeError as exc:
+        assert exc is registration_error
+        assert not has_kv_transfer_group()
+        assert store.close.call_count == 1
+    else:
+        raise AssertionError(
+            "LLM became ready after Mooncake buffer registration raised"
+        )
 
 
 @pytest.mark.parametrize("save_decode_cache", [False, True])

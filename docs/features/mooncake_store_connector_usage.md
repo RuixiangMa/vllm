@@ -536,6 +536,13 @@ restart recovery or forced teardown during transfers.
 
 ## Notes
 
+### Registration Exception Cleanup
+
+If KV cache registration raises an exception during Model Runner V2 startup,
+vLLM attempts to shut down the KV connector and clears its global reference
+before propagating the original exception. Cleanup errors are logged without
+replacing the registration exception.
+
 ### Reproducible Block Hashes Across Processes
 
 The `MooncakeStoreConnector` relies on consistent block hashes across all vLLM processes sharing the distributed store. Block hashes chain from `NONE_HASH`, which is derived from a fixed default seed, so identical prompts produce identical block hashes across processes by default — enabling cross-process prefix cache hits without extra configuration.

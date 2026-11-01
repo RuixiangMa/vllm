@@ -93,5 +93,7 @@ def ensure_kv_transfer_initialized(
 def ensure_kv_transfer_shutdown() -> None:
     global _KV_CONNECTOR_AGENT
     if _KV_CONNECTOR_AGENT is not None:
-        _KV_CONNECTOR_AGENT.shutdown()
-        _KV_CONNECTOR_AGENT = None
+        try:
+            _KV_CONNECTOR_AGENT.shutdown()
+        finally:
+            _KV_CONNECTOR_AGENT = None

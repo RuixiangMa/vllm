@@ -16,11 +16,14 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -66,7 +69,16 @@ class ActiveKVConnector(KVConnector):
         self.vllm_config = vllm_config
         self.kv_connector = get_kv_transfer_group()
         # Register kv caches with KV Connector if applicable.
-        self.kv_connector.register_kv_caches(kv_caches_dict)
+        try:
+            self.kv_connector.register_kv_caches(kv_caches_dict)
+        except Exception:
+            try:
+                kv_transfer_state.ensure_kv_transfer_shutdown()
+            except Exception:
+                logger.exception(
+                    "KV connector shutdown failed after registration error"
+                )
+            raise
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._pending_load_kwargs: dict[str, Any] | None = None

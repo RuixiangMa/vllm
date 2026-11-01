@@ -150,6 +150,24 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":nvidia: (H200 MIG 18GB) Mooncake Store Worker"
+  key: mooncake-store-worker
+  device: h200_18gb
+  num_devices: 1
+  timeout_in_minutes: 15
+  working_dir: /vllm-workspace/tests
+  source_file_dependencies:
+    - vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/
+    - vllm/distributed/mooncake_store.py
+    - vllm/distributed/kv_transfer/kv_transfer_state.py
+    - vllm/v1/worker/gpu/kv_connector.py
+    - tests/v1/kv_connector/unit/test_mooncake_store_worker.py
+    - tests/v1/attention/utils.py
+    - tests/conftest.py
+    - tests/utils.py
+  commands:
+    - pytest -v -s v1/kv_connector/unit/test_mooncake_store_worker.py
+
 # Disabled until the KV connectors installation is locked.
 # - label: ":nvidia: (H200 MIG 35GB) V1 KV Connectors"
 #   device: h200_35gb
